@@ -86,6 +86,26 @@ function renderItemLink(item: Item): HTMLElement {
 	) as HTMLElement;
 }
 
+// Welford combiner: merges two samples (n, mean, stdev) into a single
+// equivalent sample with the same per-iteration statistical content. Used to
+// accumulate Smart Sim passes without throwing away earlier iterations.
+// Reference: https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
+function combineSamples(
+	a: { n: number; mean: number; stdev: number },
+	b: { n: number; mean: number; stdev: number },
+): { n: number; mean: number; stdev: number } {
+	if (a.n === 0) return b;
+	if (b.n === 0) return a;
+	const n = a.n + b.n;
+	const delta = b.mean - a.mean;
+	const mean = (a.n * a.mean + b.n * b.mean) / n;
+	const M2_a = (a.n - 1) * a.stdev * a.stdev;
+	const M2_b = (b.n - 1) * b.stdev * b.stdev;
+	const M2 = M2_a + M2_b + (delta * delta * a.n * b.n) / n;
+	const variance = n > 1 ? M2 / (n - 1) : 0;
+	return { n, mean, stdev: Math.sqrt(variance) };
+}
+
 // Order of fallback gem pickers in the settings panel.
 const FALLBACK_GEM_COLORS: GemColor[] = [
 	GemColor.GemColorRed,
@@ -100,16 +120,22 @@ const FALLBACK_GEM_COLORS: GemColor[] = [
 // items with weaker raw stats but plausible procs / set bonuses through.
 const EP_PREFILTER_TOLERANCE = 0.15;
 
-// Smart Sim pass configuration.
-// Cheap pass first to rule out clear losers; finer passes for the survivors.
-// The final pass uses the sim's configured iteration count.
-const SMART_SIM_PASS_ITERATIONS = [100, 1000];
-// Always keep at least this many active candidates after each cull, even if the
-// statistical rule would prune more. Guards against RNG-driven false negatives.
-const MIN_SURVIVORS_AFTER_CULL = 10;
-// Cull if the upper bound of the candidate's 95% confidence interval for the
-// delta vs baseline is still below zero — i.e. confidently worse.
-const CULL_Z_SCORE = 2;
+// Smart Sim pass configuration — *cumulative* iteration budgets per item.
+// Each pass runs (budget − currentIters) more iters and combines results via
+// Welford's online combiner, so no work is thrown away. After every pass we
+// re-test each item against the baseline and early-terminate the decisive
+// ones. The final pass uses the sim's configured iteration count.
+const SMART_SIM_PASS_BUDGETS = [100, 300, 1000, 3000];
+// Always keep at least this many candidates undecided after each pass, even if
+// the statistical rule would resolve more. Guards against RNG-driven false
+// classifications at low iteration counts.
+const MIN_UNDECIDED_AFTER_PASS = 10;
+// One-sided z-score for p = 0.05. After each pass, an item's delta-vs-baseline
+// confidence interval is checked against zero in both directions:
+//   delta - z * combinedSEM > 0  → confirmed upgrade, stop simming further
+//   delta + z * combinedSEM < 0  → confirmed not-an-upgrade, cull
+//   otherwise                    → still uncertain, keep simming next pass
+const DECISIVE_Z_SCORE = 1.645;
 
 interface DroptimizerCandidate {
 	item: Item;
@@ -126,8 +152,11 @@ interface DroptimizerResult {
 	iterationsRun: number;
 	delta: number;
 	percentDelta: number;
-	status: 'active' | 'culled';
-	culledAtPass: number | null;
+	// 'active'    = still being simmed (or final pass produced no clear verdict)
+	// 'confirmed' = early-stopped: p < 0.05 that this is better than equipped
+	// 'culled'    = early-stopped: p < 0.05 that this is NOT better than equipped
+	status: 'active' | 'confirmed' | 'culled';
+	decidedAtPass: number | null;
 }
 
 export class DroptimizerTab extends SimTab {
@@ -269,7 +298,7 @@ export class DroptimizerTab extends SimTab {
 							Smart Sim (recommended)
 						</label>
 						<div className="text-muted small">
-							Screens candidates with {SMART_SIM_PASS_ITERATIONS[0]} iterations, then refines survivors. Much faster than a full sim on every item.
+							Screens candidates at {SMART_SIM_PASS_BUDGETS[0]} iterations, then accumulates more on the survivors. Each pass adds to (not replaces) the prior sample. Stops simming any item once it's statistically significant (p &lt; 0.05) as an upgrade or non-upgrade vs. the equipped item.
 						</div>
 					</div>
 
@@ -517,8 +546,11 @@ export class DroptimizerTab extends SimTab {
 
 		const originalGear = this.simUI.player.getGear();
 		const fullIterations = this.simUI.sim.getIterations();
-		const passIterations = this.useSmartSim
-			? [...SMART_SIM_PASS_ITERATIONS, fullIterations]
+		// Cumulative iteration budgets per pass. Smart Sim adds checkpoints
+		// before the full budget so items can early-terminate. Each pass runs
+		// (budget − currentIters) more iters and combines results.
+		const passBudgets = this.useSmartSim
+			? [...SMART_SIM_PASS_BUDGETS.filter(b => b < fullIterations), fullIterations]
 			: [fullIterations];
 
 		// Per-candidate result accumulator. Keyed by candidate.key.
@@ -532,7 +564,7 @@ export class DroptimizerTab extends SimTab {
 				delta: 0,
 				percentDelta: 0,
 				status: 'active',
-				culledAtPass: null,
+				decidedAtPass: null,
 			});
 		}
 
@@ -541,14 +573,14 @@ export class DroptimizerTab extends SimTab {
 		let baselineSem = 0;
 		let activeCandidates: DroptimizerCandidate[] = [...this.candidates];
 
-		// Total work is baseline + sum across passes of active * pass_iterations.
+		// Total work is baseline + sum across passes of active * 1 round each.
 		// We don't know active counts ahead of time for passes 2+, so estimate
 		// with a 30% survival rate for progress purposes.
 		let estimatedTotalRounds = 1 + this.candidates.length;
-		if (this.useSmartSim && passIterations.length > 1) {
+		if (this.useSmartSim && passBudgets.length > 1) {
 			let estimatedSurvivors = this.candidates.length;
-			for (let i = 1; i < passIterations.length; i++) {
-				estimatedSurvivors = Math.max(MIN_SURVIVORS_AFTER_CULL, Math.ceil(estimatedSurvivors * 0.3));
+			for (let i = 1; i < passBudgets.length; i++) {
+				estimatedSurvivors = Math.max(MIN_UNDECIDED_AFTER_PASS, Math.ceil(estimatedSurvivors * 0.3));
 				estimatedTotalRounds += estimatedSurvivors;
 			}
 		}
@@ -574,59 +606,67 @@ export class DroptimizerTab extends SimTab {
 			baselineSem = baselineStdev / Math.sqrt(fullIterations);
 			completedRounds++;
 
-			for (let passIdx = 0; passIdx < passIterations.length; passIdx++) {
-				const iterationsThisPass = passIterations[passIdx];
+			for (let passIdx = 0; passIdx < passBudgets.length; passIdx++) {
+				const cumulativeBudget = passBudgets[passIdx];
 				const passLabel = this.useSmartSim
-					? passIdx === passIterations.length - 1
-						? `Final pass (${iterationsThisPass.toLocaleString()} iters)`
-						: `Pass ${passIdx + 1} of ${passIterations.length} (${iterationsThisPass.toLocaleString()} iters, screening)`
-					: `Simming candidates (${iterationsThisPass.toLocaleString()} iters)`;
+					? passIdx === passBudgets.length - 1
+						? `Final pass (up to ${cumulativeBudget.toLocaleString()} iters)`
+						: `Pass ${passIdx + 1} of ${passBudgets.length} (to ${cumulativeBudget.toLocaleString()} iters)`
+					: `Simming candidates (${cumulativeBudget.toLocaleString()} iters)`;
 
 				for (let i = 0; i < activeCandidates.length; i++) {
 					this.throwIfAborted(abortSignal);
 					const candidate = activeCandidates[i];
-					const swappedGear = this.gearWithCandidate(originalGear, candidate);
+					const existing = resultsByKey.get(candidate.key)!;
 
+					// Run only the incremental iterations needed to reach the
+					// cumulative budget for this pass.
+					const itersThisBatch = cumulativeBudget - existing.iterationsRun;
+					if (itersThisBatch <= 0) {
+						completedRounds++;
+						continue;
+					}
+
+					const swappedGear = this.gearWithCandidate(originalGear, candidate);
 					const label = `${passLabel} — candidate ${i + 1}/${activeCandidates.length}`;
-					const sim = await this.runSingleSim(swappedGear, iterationsThisPass, abortSignal, progress =>
+					const sim = await this.runSingleSim(swappedGear, itersThisBatch, abortSignal, progress =>
 						setProgressForRound(label, progress),
 					);
 					if (!sim) return;
 
-					const dpsAvg = sim.raidMetrics!.dps!.avg;
-					const dpsStdev = sim.raidMetrics!.dps!.stdev;
-					const delta = dpsAvg - baselineDps;
-					const percentDelta = baselineDps > 0 ? (delta / baselineDps) * 100 : 0;
-
-					const existing = resultsByKey.get(candidate.key)!;
-					existing.dpsAvg = dpsAvg;
-					existing.dpsStdev = dpsStdev;
-					existing.iterationsRun = iterationsThisPass;
-					existing.delta = delta;
-					existing.percentDelta = percentDelta;
+					// Accumulate the new batch into the running sample using
+					// Welford's online combiner — no work thrown away.
+					const combined = combineSamples(
+						{ n: existing.iterationsRun, mean: existing.dpsAvg, stdev: existing.dpsStdev },
+						{ n: itersThisBatch, mean: sim.raidMetrics!.dps!.avg, stdev: sim.raidMetrics!.dps!.stdev },
+					);
+					existing.iterationsRun = combined.n;
+					existing.dpsAvg = combined.mean;
+					existing.dpsStdev = combined.stdev;
+					existing.delta = combined.mean - baselineDps;
+					existing.percentDelta = baselineDps > 0 ? (existing.delta / baselineDps) * 100 : 0;
 
 					completedRounds++;
-					this.renderResults(resultsByKey, baselineDps, baselineStdev, baselineSem, passIdx, passIterations.length);
+					this.renderResults(resultsByKey, baselineDps, baselineStdev, baselineSem, passIdx, passBudgets.length);
 				}
 
-				// Cull between passes (not after the final one).
-				if (passIdx < passIterations.length - 1) {
-					activeCandidates = this.cullCandidates(
+				// Classify between passes — both directions (not after the final one).
+				if (passIdx < passBudgets.length - 1) {
+					activeCandidates = this.classifyCandidates(
 						activeCandidates,
 						resultsByKey,
-						baselineDps,
 						baselineSem,
 						passIdx,
 					);
-					// Re-estimate remaining rounds based on real survivor count.
+					// Re-estimate remaining rounds based on real undecided count.
 					let remaining = activeCandidates.length;
 					estimatedTotalRounds = completedRounds + remaining;
 					let estSurv = remaining;
-					for (let nextPass = passIdx + 2; nextPass < passIterations.length; nextPass++) {
-						estSurv = Math.max(MIN_SURVIVORS_AFTER_CULL, Math.ceil(estSurv * 0.4));
+					for (let nextPass = passIdx + 2; nextPass < passBudgets.length; nextPass++) {
+						estSurv = Math.max(MIN_UNDECIDED_AFTER_PASS, Math.ceil(estSurv * 0.4));
 						estimatedTotalRounds += estSurv;
 					}
-					this.renderResults(resultsByKey, baselineDps, baselineStdev, baselineSem, passIdx, passIterations.length);
+					this.renderResults(resultsByKey, baselineDps, baselineStdev, baselineSem, passIdx, passBudgets.length);
 				}
 			}
 		} catch (error) {
@@ -643,7 +683,7 @@ export class DroptimizerTab extends SimTab {
 			this.isCancelling = false;
 			this.runButton.disabled = false;
 			this.hideProgressBanner();
-			this.renderResults(resultsByKey, baselineDps, baselineStdev, baselineSem, passIterations.length - 1, passIterations.length);
+			this.renderResults(resultsByKey, baselineDps, baselineStdev, baselineSem, passBudgets.length - 1, passBudgets.length);
 		}
 	}
 
@@ -674,43 +714,62 @@ export class DroptimizerTab extends SimTab {
 			: `${Math.floor(elapsed / 60)}m ${Math.floor(elapsed % 60)}s`;
 	}
 
-	// Returns the surviving candidates and marks the rest as culled in the results map.
-	private cullCandidates(
+	// Returns the set of still-uncertain candidates and marks the rest as
+	// either 'confirmed' (statistically-significant upgrade) or 'culled'
+	// (statistically-significant not-upgrade) in the results map.
+	private classifyCandidates(
 		active: DroptimizerCandidate[],
 		resultsByKey: Map<string, DroptimizerResult>,
-		baselineDps: number,
 		baselineSem: number,
 		passIdx: number,
 	): DroptimizerCandidate[] {
-		// Statistical rule: candidate is "confidently worse" if upper bound of its
-		// delta-vs-baseline 95% CI is still below zero.
-		const wouldCull = (r: DroptimizerResult): boolean => {
-			if (r.iterationsRun === 0) return false;
+		// Per-item one-sided test of H1: μ_candidate > μ_baseline.
+		//   z = delta / combinedSEM
+		//   verdict: 'confirmed' if z >  DECISIVE_Z_SCORE (p < 0.05 it's better)
+		//            'culled'    if z < -DECISIVE_Z_SCORE (p < 0.05 it's worse)
+		//            'uncertain' otherwise
+		const verdict = (r: DroptimizerResult): 'confirmed' | 'culled' | 'uncertain' => {
+			if (r.iterationsRun === 0) return 'uncertain';
 			const candidateSem = r.dpsStdev / Math.sqrt(r.iterationsRun);
 			const combinedSem = Math.sqrt(candidateSem * candidateSem + baselineSem * baselineSem);
-			const upperBound = r.delta + CULL_Z_SCORE * combinedSem;
-			return upperBound < 0;
+			if (combinedSem === 0) return 'uncertain';
+			const z = r.delta / combinedSem;
+			if (z > DECISIVE_Z_SCORE) return 'confirmed';
+			if (z < -DECISIVE_Z_SCORE) return 'culled';
+			return 'uncertain';
 		};
 
-		const survivorsRaw = active.filter(c => !wouldCull(resultsByKey.get(c.key)!));
+		const verdicts = new Map<string, 'confirmed' | 'culled' | 'uncertain'>();
+		for (const c of active) verdicts.set(c.key, verdict(resultsByKey.get(c.key)!));
 
-		// Apply the floor: if statistical culling would leave fewer than the
-		// floor, instead keep top-N by current dpsAvg.
-		const survivors = survivorsRaw.length >= MIN_SURVIVORS_AFTER_CULL
-			? survivorsRaw
-			: [...active]
-					.sort((a, b) => resultsByKey.get(b.key)!.dpsAvg - resultsByKey.get(a.key)!.dpsAvg)
-					.slice(0, MIN_SURVIVORS_AFTER_CULL);
+		const uncertainRaw = active.filter(c => verdicts.get(c.key) === 'uncertain');
 
-		const survivorKeys = new Set(survivors.map(c => c.key));
-		for (const c of active) {
-			if (!survivorKeys.has(c.key)) {
-				const r = resultsByKey.get(c.key)!;
-				r.status = 'culled';
-				r.culledAtPass = passIdx + 1;
-			}
+		// Floor: if statistical classification would resolve everyone, keep the
+		// top-K most ambiguous (smallest |z|) so RNG-driven false classifications
+		// at low iteration counts get another pass to either confirm or refute.
+		let uncertain = uncertainRaw;
+		if (uncertain.length < MIN_UNDECIDED_AFTER_PASS && active.length >= MIN_UNDECIDED_AFTER_PASS) {
+			const ranked = [...active].sort((a, b) => {
+				const ra = resultsByKey.get(a.key)!;
+				const rb = resultsByKey.get(b.key)!;
+				const za = ra.iterationsRun > 0 ? Math.abs(ra.delta) / Math.max(1e-9, Math.sqrt((ra.dpsStdev * ra.dpsStdev) / ra.iterationsRun + baselineSem * baselineSem)) : 0;
+				const zb = rb.iterationsRun > 0 ? Math.abs(rb.delta) / Math.max(1e-9, Math.sqrt((rb.dpsStdev * rb.dpsStdev) / rb.iterationsRun + baselineSem * baselineSem)) : 0;
+				return za - zb;
+			});
+			uncertain = ranked.slice(0, MIN_UNDECIDED_AFTER_PASS);
 		}
-		return survivors;
+
+		const uncertainKeys = new Set(uncertain.map(c => c.key));
+		for (const c of active) {
+			if (uncertainKeys.has(c.key)) continue;
+			const r = resultsByKey.get(c.key)!;
+			const v = verdicts.get(c.key)!;
+			// v is 'uncertain' only if forced out by the floor; treat as still active.
+			if (v === 'uncertain') continue;
+			r.status = v;
+			r.decidedAtPass = passIdx + 1;
+		}
+		return uncertain;
 	}
 
 	private gearWithCandidate(baseGear: Gear, candidate: DroptimizerCandidate): Gear {
@@ -814,7 +873,11 @@ export class DroptimizerTab extends SimTab {
 		this.lastResults = { resultsByKey, baselineDps, baselineStdev, baselineSem, currentPassIdx, totalPasses };
 
 		const allResults = Array.from(resultsByKey.values()).filter(r => r.iterationsRun > 0);
-		const active = allResults.filter(r => r.status === 'active').sort((a, b) => b.delta - a.delta);
+		// "Shown" = anything not culled. Confirmed upgrades + still-uncertain
+		// items are both displayed in the main table, sorted by delta.
+		const shown = allResults.filter(r => r.status !== 'culled').sort((a, b) => b.delta - a.delta);
+		const confirmedCount = shown.filter(r => r.status === 'confirmed').length;
+		const activeCount = shown.length - confirmedCount;
 		const culled = allResults.filter(r => r.status === 'culled').sort((a, b) => b.delta - a.delta);
 
 		const grouped = new Map<string, DroptimizerResult[]>();
@@ -822,7 +885,7 @@ export class DroptimizerTab extends SimTab {
 		const groupKey = (r: DroptimizerResult) =>
 			this.viewMode === 'boss' ? r.candidate.bossName : ITEM_SLOT_NAMES[r.candidate.slot] ?? ItemSlot[r.candidate.slot];
 
-		for (const result of active) {
+		for (const result of shown) {
 			const key = groupKey(result);
 			if (!grouped.has(key)) {
 				grouped.set(key, []);
@@ -846,7 +909,9 @@ export class DroptimizerTab extends SimTab {
 				<div className="droptimizer-baseline mb-3">
 					<strong>Baseline DPS:</strong> {fmtDps(baselineDps)} <span className="text-muted small">(±{fmtDps(baselineStdev)})</span>
 					{' · '}
-					<span className="text-muted small">{passLabel} · {active.length} active, {culled.length} culled</span>
+					<span className="text-muted small">
+						{passLabel} · {confirmedCount} confirmed, {activeCount} uncertain, {culled.length} culled
+					</span>
 				</div>
 				{orderedGroups.map(([groupName, groupResults]) => (
 					<div className="droptimizer-group mb-4">
@@ -864,8 +929,17 @@ export class DroptimizerTab extends SimTab {
 							</thead>
 							<tbody>
 								{groupResults.map(result => (
-									<tr>
-										<td>{renderItemLink(result.candidate.item)}</td>
+									<tr className={clsx(result.status === 'confirmed' && 'droptimizer-row-confirmed')}>
+										<td>
+											{result.status === 'confirmed' && (
+												<span
+													className="droptimizer-confirmed-badge text-success me-1"
+													attributes={{ title: `Confirmed upgrade (p < 0.05) at pass ${result.decidedAtPass}` }}>
+													✓
+												</span>
+											)}
+											{renderItemLink(result.candidate.item)}
+										</td>
 										<td className="text-muted small">
 											{this.viewMode === 'boss'
 												? ITEM_SLOT_NAMES[result.candidate.slot] ?? ItemSlot[result.candidate.slot]
@@ -909,7 +983,7 @@ export class DroptimizerTab extends SimTab {
 								<td className="small">{result.candidate.bossName}</td>
 								<td className="text-end text-danger">{fmtDelta(result.delta)}</td>
 								<td className="text-end text-danger">{fmtPct(result.percentDelta)}</td>
-								<td className="text-end small">Pass {result.culledAtPass ?? '?'} ({result.iterationsRun.toLocaleString()} iters)</td>
+								<td className="text-end small">Pass {result.decidedAtPass ?? '?'} ({result.iterationsRun.toLocaleString()} iters)</td>
 							</tr>
 						))}
 					</tbody>

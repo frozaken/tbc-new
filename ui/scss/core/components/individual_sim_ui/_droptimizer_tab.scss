@@ -58,6 +58,15 @@
 		}
 	}
 
+	.droptimizer-row-confirmed {
+		// Subtle green tint to mark statistically-confirmed upgrades.
+		background-color: rgba(40, 167, 69, 0.07);
+	}
+
+	.droptimizer-confirmed-badge {
+		font-weight: 700;
+	}
+
 	.droptimizer-gem-row {
 		display: flex;
 		gap: 4px;
