@@ -57,6 +57,7 @@ interface SimProps {
 
 export type RunSimOptions = {
 	silent?: boolean; // If true, don't emit the simResultEmitter event.
+	iterations?: number; // If set, overrides the sim's configured iteration count for this run. Used by Smart Sim multi-pass droptimizer.
 };
 
 const WASM_CONCURRENCY_STORAGE_KEY = `${LOCAL_STORAGE_PREFIX}_wasmconcurrency`;
@@ -306,7 +307,7 @@ export class Sim {
 	async runRaidSimLightweight(
 		gear: Gear,
 		onProgress: WorkerProgressCallback,
-		_: RunSimOptions = {},
+		options: RunSimOptions = {},
 	): Promise<[RaidSimRequest, RaidSimResult] | ErrorOutcome> {
 		if (this.raid.isEmpty()) {
 			throw new Error('Raid is empty! Try adding some players first.');
@@ -319,6 +320,9 @@ export class Sim {
 			await this.waitForInit();
 
 			const request = this.makeRaidSimRequest(false);
+			if (options.iterations && options.iterations > 0 && request.simOptions) {
+				request.simOptions.iterations = options.iterations;
+			}
 			const player = request.raid!.parties[0].players[0];
 
 			// Remove any inactive meta gems, since the backend doesn't have its own validation.

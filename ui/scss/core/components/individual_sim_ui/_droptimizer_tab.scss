@@ -1,0 +1,135 @@
+#droptimizer-tab {
+	padding: var(--gap-width);
+
+	// Bootstrap's .text-muted is too dim for helper copy on this dark theme.
+	// Bump contrast so the explanatory lines under each control are readable.
+	.text-muted {
+		color: rgba(255, 255, 255, 0.7) !important;
+	}
+
+	.droptimizer-tab-content {
+		display: flex;
+		flex-direction: column;
+		gap: var(--gap-width);
+	}
+
+	.droptimizer-tab-settings {
+		padding: var(--spacer-3);
+		border: var(--border-default);
+		background: var(--bs-body-bg);
+		max-width: 520px;
+	}
+
+	.droptimizer-tab-results {
+		padding: var(--spacer-3);
+		border: var(--border-default);
+		background: var(--bs-body-bg);
+	}
+
+	.droptimizer-group-name {
+		margin-bottom: var(--spacer-2);
+		padding-bottom: var(--spacer-1);
+		border-bottom: var(--border-default);
+	}
+
+	.droptimizer-item-link {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+		text-decoration: none;
+
+		&:hover .droptimizer-item-name {
+			text-decoration: underline;
+		}
+	}
+
+	.droptimizer-item-icon {
+		width: 24px;
+		height: 24px;
+		border-radius: 3px;
+		border: 1px solid rgba(0, 0, 0, 0.4);
+		flex-shrink: 0;
+	}
+
+	.droptimizer-results-table {
+		td,
+		th {
+			vertical-align: middle;
+		}
+	}
+
+	.droptimizer-gem-row {
+		display: flex;
+		gap: 4px;
+	}
+
+	.droptimizer-gem-socket {
+		position: relative;
+		height: 30px;
+		width: 30px;
+		cursor: pointer;
+
+		.droptimizer-socket-icon {
+			height: 100%;
+			width: 100%;
+		}
+
+		.droptimizer-gem-icon {
+			position: absolute;
+			top: 0;
+			left: 0;
+			height: 100%;
+			width: 100%;
+
+			&.hide {
+				display: none;
+			}
+		}
+	}
+
+	.droptimizer-culled-section summary {
+		cursor: pointer;
+		user-select: none;
+	}
+
+	.droptimizer-progress-banner {
+		padding: var(--spacer-3);
+		border: var(--border-default);
+		background: var(--bs-body-bg);
+		display: flex;
+		flex-direction: column;
+		gap: var(--spacer-2);
+
+		&.hide {
+			display: none;
+		}
+
+		.droptimizer-progress-row {
+			display: flex;
+			align-items: center;
+			gap: var(--spacer-3);
+			justify-content: space-between;
+		}
+
+		.droptimizer-progress-text {
+			flex: 1;
+			min-width: 0;
+		}
+
+		.droptimizer-progress-title {
+			font-weight: 600;
+		}
+
+		.droptimizer-progress-meta {
+			margin-top: 2px;
+		}
+
+		.droptimizer-progress-bar-outer {
+			height: 6px;
+		}
+
+		.droptimizer-progress-cancel {
+			flex-shrink: 0;
+		}
+	}
+}
