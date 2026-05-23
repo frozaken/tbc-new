@@ -137,6 +137,12 @@ const MIN_UNDECIDED_AFTER_PASS = 10;
 //   otherwise                    → still uncertain, keep simming next pass
 const DECISIVE_Z_SCORE = 1.645;
 
+// Floor on iterations before an item can be marked 'confirmed'. The z-test
+// can resolve "this is an upgrade" at 100 iters, but the +ΔDPS *point estimate*
+// is still noisy at that count. Holding confirmation until at least this many
+// iterations keeps the displayed gain credible.
+const MIN_ITERS_FOR_CONFIRMATION = 1000;
+
 interface DroptimizerCandidate {
 	item: Item;
 	slot: ItemSlot;
@@ -298,7 +304,7 @@ export class DroptimizerTab extends SimTab {
 							Smart Sim (recommended)
 						</label>
 						<div className="text-muted small">
-							Screens candidates at {SMART_SIM_PASS_BUDGETS[0]} iterations, then accumulates more on the survivors. Each pass adds to (not replaces) the prior sample. Stops simming any item once it's statistically significant (p &lt; 0.05) as an upgrade or non-upgrade vs. the equipped item.
+							Screens candidates at {SMART_SIM_PASS_BUDGETS[0]} iterations, then accumulates more on the survivors. Each pass adds to (not replaces) the prior sample. Stops simming any item once it's statistically significant (p &lt; 0.05) as an upgrade or non-upgrade vs. the equipped item, with at least {MIN_ITERS_FOR_CONFIRMATION.toLocaleString()} iterations required before an upgrade is confirmed.
 						</div>
 					</div>
 
@@ -728,13 +734,18 @@ export class DroptimizerTab extends SimTab {
 		//   verdict: 'confirmed' if z >  DECISIVE_Z_SCORE (p < 0.05 it's better)
 		//            'culled'    if z < -DECISIVE_Z_SCORE (p < 0.05 it's worse)
 		//            'uncertain' otherwise
+		// Confirmation is additionally gated on a minimum iteration count so the
+		// displayed ΔDPS for confirmed items has a tight enough SE to be trusted.
 		const verdict = (r: DroptimizerResult): 'confirmed' | 'culled' | 'uncertain' => {
 			if (r.iterationsRun === 0) return 'uncertain';
 			const candidateSem = r.dpsStdev / Math.sqrt(r.iterationsRun);
 			const combinedSem = Math.sqrt(candidateSem * candidateSem + baselineSem * baselineSem);
 			if (combinedSem === 0) return 'uncertain';
 			const z = r.delta / combinedSem;
-			if (z > DECISIVE_Z_SCORE) return 'confirmed';
+			if (z > DECISIVE_Z_SCORE) {
+				if (r.iterationsRun < MIN_ITERS_FOR_CONFIRMATION) return 'uncertain';
+				return 'confirmed';
+			}
 			if (z < -DECISIVE_Z_SCORE) return 'culled';
 			return 'uncertain';
 		};
